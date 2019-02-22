@@ -27,7 +27,7 @@ The entry point of the framework is the `Service`. The `Service` uses `Component
     - create a fork
     - git clone the fork on your machine
     - enable [signing your work](SIGNYOURWORK.md)
-    - create a PR. use WIP to mark unfinished work
+    - create a PR. use WIP to mark unfinished work e.g. __WIP: Fixing a bug (fixes #1)__
     - after development has finished remove the WIP if applied
 5. **Curators**: The curators will conduct a full code review
 6. **Curators**: After at least 2 curators have approved the PR, it will be merged to master
