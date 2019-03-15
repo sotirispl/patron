@@ -88,12 +88,13 @@ type Factory struct {
 	name    string
 	ct      string
 	topic   string
+	group   string
 	brokers []string
 	oo      []OptionFunc
 }
 
 // New constructor.
-func New(name, ct, topic string, brokers []string, oo ...OptionFunc) (*Factory, error) {
+func New(name, ct, topic, group string, brokers []string, oo ...OptionFunc) (*Factory, error) {
 
 	if name == "" {
 		return nil, errors.New("name is required")
@@ -107,7 +108,11 @@ func New(name, ct, topic string, brokers []string, oo ...OptionFunc) (*Factory, 
 		return nil, errors.New("topic is required")
 	}
 
-	return &Factory{name: name, ct: ct, topic: topic, brokers: brokers, oo: oo}, nil
+	if group == "" {
+		return nil, errors.New("group is required")
+	}
+
+	return &Factory{name: name, ct: ct, topic: topic, group: group, brokers: brokers, oo: oo}, nil
 }
 
 // Create a new consumer.
@@ -126,6 +131,7 @@ func (f *Factory) Create() (async.Consumer, error) {
 	c := &consumer{
 		brokers:     f.brokers,
 		topic:       f.topic,
+		group:       f.group,
 		cfg:         config,
 		contentType: f.ct,
 		buffer:      1000,
@@ -147,12 +153,13 @@ func (f *Factory) Create() (async.Consumer, error) {
 type consumer struct {
 	brokers     []string
 	topic       string
+	group       string
 	buffer      int
 	start       Offset
 	cfg         *sarama.Config
 	contentType string
 	cnl         context.CancelFunc
-	ms          sarama.Consumer
+	cg          sarama.ConsumerGroup
 	info        map[string]interface{}
 }
 
@@ -166,73 +173,43 @@ func (c *consumer) Consume(ctx context.Context) (<-chan async.Message, <-chan er
 	ctx, cnl := context.WithCancel(ctx)
 	c.cnl = cnl
 
-	pcs, err := c.consumers()
+	cg, err := sarama.NewConsumerGroup(c.brokers, c.group, c.cfg)
 	if err != nil {
-		return nil, nil, errors.Wrap(err, "failed to get partitions")
+		return nil, nil, errors.Wrap(err, "failed to create consumer")
 	}
-	// When kafka cluster is not fully initialized, we may get 0 partions.
-	if len(pcs) == 0 {
-		return nil, nil, errors.New("got 0 partitions")
-	}
+	c.cg = cg
 
-	log.Infof("consuming messages for topic '%s' from %d partitions", c.topic, len(pcs))
+	log.Infof("consuming messages from topic '%s' using group '%s'", c.topic, c.group)
 	chMsg := make(chan async.Message, c.buffer)
 	chErr := make(chan error, c.buffer)
 
-	for _, pc := range pcs {
-		go func(consumer sarama.PartitionConsumer) {
-			for {
-				select {
-				case <-ctx.Done():
-					log.Info("canceling consuming messages requested")
-					closeConsumer(consumer)
-					return
-				case consumerError := <-consumer.Errors():
-					closeConsumer(consumer)
-					chErr <- consumerError
-					return
-				case m := <-consumer.Messages():
-					log.Debugf("data received from topic %s", m.Topic)
-					topicPartitionOffsetDiffGaugeSet(m.Topic, m.Partition, consumer.HighWaterMarkOffset(), m.Offset)
-					go func(msg *sarama.ConsumerMessage) {
-						sp, chCtx := trace.ConsumerSpan(
-							ctx,
-							trace.ComponentOpName(trace.KafkaConsumerComponent, msg.Topic),
-							trace.KafkaConsumerComponent,
-							mapHeader(msg.Headers),
-						)
-						var ct string
-						if c.contentType != "" {
-							ct = c.contentType
-						} else {
-							ct, err = determineContentType(msg.Headers)
-							if err != nil {
-								trace.SpanError(sp)
-								chErr <- errors.Wrap(err, "failed to determine content type")
-								return
-							}
-						}
-
-						dec, err := async.DetermineDecoder(ct)
-						if err != nil {
-							trace.SpanError(sp)
-							chErr <- errors.Wrapf(err, "failed to determine decoder for %s", ct)
-							return
-						}
-
-						chCtx = log.WithContext(chCtx, log.Sub(map[string]interface{}{"messageID": uuid.New().String()}))
-
-						chMsg <- &message{
-							ctx:  chCtx,
-							dec:  dec,
-							span: sp,
-							val:  msg.Value,
-						}
-					}(m)
-				}
+	go func(consumer sarama.ConsumerGroup) {
+		for {
+			select {
+			case <-ctx.Done():
+				log.Info("canceling consuming messages requested")
+				closeConsumer(consumer)
+				return
+			case consumerError := <-consumer.Errors():
+				closeConsumer(consumer)
+				chErr <- consumerError
+				return
 			}
-		}(pc)
-	}
+		}
+	}(c.cg)
+
+	// Iterate over consumer sessions.
+	go func(topic string, consumer sarama.ConsumerGroup) {
+		ctx := context.Background()
+		for {
+			topics := []string{c.topic}
+			handler := handler{consumer: c, messages: chMsg}
+			err := consumer.Consume(ctx, topics, handler)
+			if err != nil {
+				chErr <- err
+			}
+		}
+	}(c.topic, c.cg)
 
 	return chMsg, chErr, nil
 }
@@ -243,38 +220,11 @@ func (c *consumer) Close() error {
 		c.cnl()
 	}
 
-	if c.ms == nil {
+	if c.cg == nil {
 		return nil
 	}
 
-	return errors.Wrap(c.ms.Close(), "failed to close consumer")
-}
-
-func (c *consumer) consumers() ([]sarama.PartitionConsumer, error) {
-
-	ms, err := sarama.NewConsumer(c.brokers, c.cfg)
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to create consumer")
-	}
-	c.ms = ms
-
-	partitions, err := c.ms.Partitions(c.topic)
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to get partitions")
-	}
-
-	pcs := make([]sarama.PartitionConsumer, len(partitions))
-
-	for i, partition := range partitions {
-
-		pc, err := c.ms.ConsumePartition(c.topic, partition, int64(c.start))
-		if nil != err {
-			return nil, errors.Wrap(err, "failed to get partition consumer")
-		}
-		pcs[i] = pc
-	}
-
-	return pcs, nil
+	return errors.Wrap(c.cg.Close(), "failed to close consumer")
 }
 
 func (c *consumer) createInfo() {
@@ -286,7 +236,58 @@ func (c *consumer) createInfo() {
 	c.info["start"] = c.start.String()
 }
 
-func closeConsumer(cns sarama.PartitionConsumer) {
+type handler struct {
+	consumer *consumer
+	messages chan async.Message
+}
+
+func (h handler) Setup(_ sarama.ConsumerGroupSession) error   { return nil }
+func (h handler) Cleanup(_ sarama.ConsumerGroupSession) error { return nil }
+func (h handler) ConsumeClaim(sess sarama.ConsumerGroupSession, claim sarama.ConsumerGroupClaim) error {
+	ctx := context.Background()
+	for msg := range claim.Messages() {
+		log.Debugf("data received from topic %s", msg.Topic)
+		sp, chCtx := trace.ConsumerSpan(
+			ctx,
+			trace.ComponentOpName(trace.KafkaConsumerComponent, msg.Topic),
+			trace.KafkaConsumerComponent,
+			mapHeader(msg.Headers),
+		)
+
+		var ct string
+		if h.consumer.contentType != "" {
+			ct = h.consumer.contentType
+		} else {
+			ctTemp, err := determineContentType(msg.Headers)
+			if err != nil {
+				trace.SpanError(sp)
+				return errors.Wrap(err, "failed to determine content type")
+			}
+			ct = ctTemp
+		}
+
+		dec, err := async.DetermineDecoder(ct)
+		if err != nil {
+			trace.SpanError(sp)
+			return errors.Wrapf(err, "failed to determine decoder for %s", ct)
+		}
+
+		topicPartitionOffsetDiffGaugeSet(msg.Topic, msg.Partition, claim.HighWaterMarkOffset(), msg.Offset)
+
+		sess.MarkMessage(msg, "")
+
+		chCtx = log.WithContext(chCtx, log.Sub(map[string]interface{}{"messageID": uuid.New().String()}))
+		h.messages <- &message{
+			ctx:  chCtx,
+			dec:  dec,
+			span: sp,
+			val:  msg.Value,
+		}
+	}
+	return nil
+}
+
+func closeConsumer(cns sarama.ConsumerGroup) {
 	if cns == nil {
 		return
 	}
@@ -312,4 +313,3 @@ func mapHeader(hh []*sarama.RecordHeader) map[string]string {
 	}
 	return mp
 }
-
