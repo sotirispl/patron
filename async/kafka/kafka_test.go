@@ -14,25 +14,6 @@ import (
 	"github.com/thebeatapp/patron/encoding/json"
 )
 
-func TestOffset_String(t *testing.T) {
-	tests := []struct {
-		name string
-		o    Offset
-		want string
-	}{
-		{name: "OffsetNewest", o: OffsetNewest, want: "OffsetNewest"},
-		{name: "OffsetOldest", o: OffsetOldest, want: "OffsetOldest"},
-		{name: "10", o: 10, want: "10"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := tt.o.String(); got != tt.want {
-				t.Errorf("Offset.String() = %v, want %v", got, tt.want)
-			}
-		})
-	}
-}
-
 func TestNew(t *testing.T) {
 	brokers := []string{"192.168.1.1"}
 	type args struct {
@@ -162,9 +143,9 @@ func TestConsumer_Info(t *testing.T) {
 	expected["type"] = "kafka-consumer"
 	expected["brokers"] = "1,2"
 	expected["topic"] = "topic"
+	expected["group"] = "group"
 	expected["buffer"] = 1000
 	expected["default-content-type"] = "application/json"
-	expected["start"] = OffsetNewest.String()
 	assert.Equal(t, expected, c.Info())
 }
 

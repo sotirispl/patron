@@ -20,8 +20,8 @@ import (
 
 var topicPartitionOffsetDiff *prometheus.GaugeVec
 
-func topicPartitionOffsetDiffGaugeSet(topic string, partition int32, high, offset int64) {
-	topicPartitionOffsetDiff.WithLabelValues(topic, strconv.FormatInt(int64(partition), 10)).Set(float64(high - offset))
+func topicPartitionOffsetDiffGaugeSet(group, topic string, partition int32, high, offset int64) {
+	topicPartitionOffsetDiff.WithLabelValues(group, topic, strconv.FormatInt(int64(partition), 10)).Set(float64(high - offset))
 }
 
 func init() {
@@ -32,7 +32,7 @@ func init() {
 			Name:      "offset_diff",
 			Help:      "Message offset difference with high watermark, classified by topic and partition",
 		},
-		[]string{"topic", "partition"},
+		[]string{"group", "topic", "partition"},
 	)
 	prometheus.MustRegister(topicPartitionOffsetDiff)
 }
@@ -60,27 +60,6 @@ func (m *message) Ack() error {
 func (m *message) Nack() error {
 	trace.SpanError(m.span)
 	return nil
-}
-
-// Offset defines the offset of messages inside a topic.
-type Offset int64
-
-const (
-	// OffsetNewest starts consuming from the newest available message in the topic.
-	OffsetNewest Offset = -1
-	// OffsetOldest starts consuming from the oldest available message in the topic.
-	OffsetOldest Offset = -2
-)
-
-func (o Offset) String() string {
-	switch o {
-	case OffsetNewest:
-		return "OffsetNewest"
-	case OffsetOldest:
-		return "OffsetOldest"
-	default:
-		return strconv.FormatInt(int64(o), 10)
-	}
 }
 
 // Factory definition of a consumer factory.
@@ -132,10 +111,10 @@ func (f *Factory) Create() (async.Consumer, error) {
 		brokers:     f.brokers,
 		topic:       f.topic,
 		group:       f.group,
+		traceTag: opentracing.Tag{Key: "group", Value: f.group},
 		cfg:         config,
 		contentType: f.ct,
 		buffer:      1000,
-		start:       OffsetNewest,
 		info:        make(map[string]interface{}),
 	}
 
@@ -155,7 +134,7 @@ type consumer struct {
 	topic       string
 	group       string
 	buffer      int
-	start       Offset
+	traceTag    opentracing.Tag
 	cfg         *sarama.Config
 	contentType string
 	cnl         context.CancelFunc
@@ -200,10 +179,9 @@ func (c *consumer) Consume(ctx context.Context) (<-chan async.Message, <-chan er
 
 	// Iterate over consumer sessions.
 	go func(topic string, consumer sarama.ConsumerGroup) {
-		ctx := context.Background()
+		topics := []string{c.topic}
+		handler := handler{consumer: c, messages: chMsg}
 		for {
-			topics := []string{c.topic}
-			handler := handler{consumer: c, messages: chMsg}
 			err := consumer.Consume(ctx, topics, handler)
 			if err != nil {
 				chErr <- err
@@ -230,10 +208,10 @@ func (c *consumer) Close() error {
 func (c *consumer) createInfo() {
 	c.info["type"] = "kafka-consumer"
 	c.info["brokers"] = strings.Join(c.brokers, ",")
+	c.info["group"] = c.group
 	c.info["topic"] = c.topic
 	c.info["buffer"] = c.buffer
 	c.info["default-content-type"] = c.contentType
-	c.info["start"] = c.start.String()
 }
 
 type handler struct {
@@ -244,7 +222,7 @@ type handler struct {
 func (h handler) Setup(_ sarama.ConsumerGroupSession) error   { return nil }
 func (h handler) Cleanup(_ sarama.ConsumerGroupSession) error { return nil }
 func (h handler) ConsumeClaim(sess sarama.ConsumerGroupSession, claim sarama.ConsumerGroupClaim) error {
-	ctx := context.Background()
+	ctx := sess.Context()
 	for msg := range claim.Messages() {
 		log.Debugf("data received from topic %s", msg.Topic)
 		sp, chCtx := trace.ConsumerSpan(
@@ -252,6 +230,7 @@ func (h handler) ConsumeClaim(sess sarama.ConsumerGroupSession, claim sarama.Con
 			trace.ComponentOpName(trace.KafkaConsumerComponent, msg.Topic),
 			trace.KafkaConsumerComponent,
 			mapHeader(msg.Headers),
+			h.consumer.traceTag,
 		)
 
 		var ct string
@@ -272,9 +251,7 @@ func (h handler) ConsumeClaim(sess sarama.ConsumerGroupSession, claim sarama.Con
 			return errors.Wrapf(err, "failed to determine decoder for %s", ct)
 		}
 
-		topicPartitionOffsetDiffGaugeSet(msg.Topic, msg.Partition, claim.HighWaterMarkOffset(), msg.Offset)
-
-		sess.MarkMessage(msg, "")
+		topicPartitionOffsetDiffGaugeSet(h.consumer.group, msg.Topic, msg.Partition, claim.HighWaterMarkOffset(), msg.Offset)
 
 		chCtx = log.WithContext(chCtx, log.Sub(map[string]interface{}{"messageID": uuid.New().String()}))
 		h.messages <- &message{
@@ -283,6 +260,8 @@ func (h handler) ConsumeClaim(sess sarama.ConsumerGroupSession, claim sarama.Con
 			span: sp,
 			val:  msg.Value,
 		}
+
+		sess.MarkMessage(msg, "")
 	}
 	return nil
 }

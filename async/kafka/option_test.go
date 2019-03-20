@@ -33,12 +33,6 @@ func TestBuffer(t *testing.T) {
 	}
 }
 
-func TestStart(t *testing.T) {
-	c := consumer{}
-	err := Start(1000)(&c)
-	assert.NoError(t, err)
-}
-
 func TestTimeout(t *testing.T) {
 	c := consumer{cfg: sarama.NewConfig()}
 	err := Timeout(time.Second)(&c)
