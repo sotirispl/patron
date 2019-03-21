@@ -40,8 +40,9 @@ func init() {
 type message struct {
 	span opentracing.Span
 	ctx  context.Context
+	sess sarama.ConsumerGroupSession
+	msg  *sarama.ConsumerMessage
 	dec  encoding.DecodeRawFunc
-	val  []byte
 }
 
 func (m *message) Context() context.Context {
@@ -49,10 +50,11 @@ func (m *message) Context() context.Context {
 }
 
 func (m *message) Decode(v interface{}) error {
-	return m.dec(m.val, v)
+	return m.dec(m.msg.Value, v)
 }
 
 func (m *message) Ack() error {
+	m.sess.MarkMessage(m.msg, "")
 	trace.SpanSuccess(m.span)
 	return nil
 }
@@ -111,10 +113,10 @@ func (f *Factory) Create() (async.Consumer, error) {
 		brokers:     f.brokers,
 		topic:       f.topic,
 		group:       f.group,
-		traceTag: opentracing.Tag{Key: "group", Value: f.group},
+		traceTag:    opentracing.Tag{Key: "group", Value: f.group},
 		cfg:         config,
 		contentType: f.ct,
-		buffer:      1000,
+		buffer:      0,
 		info:        make(map[string]interface{}),
 	}
 
@@ -255,13 +257,12 @@ func (h handler) ConsumeClaim(sess sarama.ConsumerGroupSession, claim sarama.Con
 
 		chCtx = log.WithContext(chCtx, log.Sub(map[string]interface{}{"messageID": uuid.New().String()}))
 		h.messages <- &message{
+			sess: sess,
+			msg:  msg,
 			ctx:  chCtx,
 			dec:  dec,
 			span: sp,
-			val:  msg.Value,
 		}
-
-		sess.MarkMessage(msg, "")
 	}
 	return nil
 }

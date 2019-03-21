@@ -144,7 +144,7 @@ func TestConsumer_Info(t *testing.T) {
 	expected["brokers"] = "1,2"
 	expected["topic"] = "topic"
 	expected["group"] = "group"
-	expected["buffer"] = 1000
+	expected["buffer"] = 0
 	expected["default-content-type"] = "application/json"
 	assert.Equal(t, expected, c.Info())
 }
@@ -154,11 +154,16 @@ func Test_message(t *testing.T) {
 	opentracing.SetGlobalTracer(mtr)
 	sp := opentracing.StartSpan("test")
 	ctx := context.Background()
+	cm := &sarama.ConsumerMessage{
+		Value: []byte(`{"key":"value"}`),
+	}
+	sess := &mockConsumerSession{}
 	msg := message{
+		sess: sess,
 		ctx:  ctx,
 		dec:  json.DecodeRaw,
 		span: sp,
-		val:  []byte(`{"key":"value"}`),
+		msg:  cm,
 	}
 
 	assert.NotNil(t, msg.Context())
